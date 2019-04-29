@@ -1,0 +1,171 @@
+---
+title: "An example of using supervised classification"
+output: html_notebook
+---
+
+This notebook trains a classification model which distinguishes between actual quotations to the biblical text and mere noise. 
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(parsnip)
+library(dials)
+library(keras)
+library(probably)
+library(ggrepel)
+```
+
+
+```{r}
+spec <- cols(verse_id = col_character(),
+             doc_id = col_character(),
+             match = readr::col_factor(levels = c("quotation", "noise")),
+             tokens = col_integer(),
+             tfidf = col_double(),
+             proportion = col_double(),
+             runs_pval = col_double(), 
+             sim_total = col_double(), 
+             sim_mean = col_double())
+training <- read_csv("apb-training.csv", col_types = spec)
+testing <- read_csv("apb-testing.csv", col_types = spec)
+rm(spec)
+```
+
+We are going to remove the `verse_id` and `doc_id` columns because they are not predictor or response variables. 
+
+```{r}
+training <- training %>% select(-verse_id, -doc_id)
+testing <- testing %>% select(-verse_id, -doc_id)
+```
+
+Some brief exploration of the data confirms that there is a clear separation in the data.
+
+```{r}
+training %>% 
+  group_by(match) %>% 
+  summarize(n(), mean(tokens), mean(tfidf),
+            mean(proportion), mean(runs_pval),
+            mean(sim_total), mean(sim_mean)) %>% 
+  gather("measurement", "value", -match) %>% 
+  mutate(value = round(value, 2)) %>% 
+  spread(match, value)
+```
+
+We can also see the separation in the data, thought it is not as clear as we would like.
+
+```{r}
+ggplot(training, aes(tokens, tfidf, color = match)) +
+  geom_jitter(shape = 1) +
+  theme_classic() +
+  coord_cartesian(xlim = c(0, 100), ylim = c(0, 12)) +
+  labs(title = "Comparison of genuine quotations versus noise")
+```
+
+We are going to pre-process the data to center and scale the predictors.
+
+```{r}
+data_recipe <- recipe(match ~ ., data = training) %>% 
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  prep(training = training, retain = TRUE)
+
+training_normalized = bake(data_recipe, new_data = training)
+testing_normalized = bake(data_recipe, new_data = testing)
+```
+
+Some helper functions for running the predictions and computing the accuracy measures.
+
+```{r}
+# Calculate the confusion matrix and the resulting accuracy measures
+predictions <- function(model, type = c("training", "testing")) {
+  type <- match.arg(type)
+  df <- switch(type,
+               training = training_normalized,
+               testing = testing_normalized)
+  df %>% 
+    select(match) %>% 
+    mutate(pred_class = predict(model, df, type = "class")$.pred_class,
+           pred_probs = predict(model, df, type = "prob")$.pred_quotation) 
+}
+
+accuracy_measures <- function(model, type = c("training", "testing")) {
+  type <- match.arg(type)
+  preds <- model %>%  predictions(type = type)
+  bind_rows(
+    preds %>% conf_mat(truth = match, estimate = pred_class) %>% summary(),
+    preds %>% roc_auc(match, pred_probs)
+  )
+}
+```
+
+```{r, warning=FALSE}
+def_log <- logistic_reg(mode = "classification", penalty = 10, mixture = 0.1) %>% set_engine("glm")
+predictors <- match ~ tokens + tfidf + proportion + runs_pval + sim_mean
+model <- parsnip::fit(def_log, predictors, data = training_normalized)
+model
+```
+
+A different model.
+
+```{r}
+def_tree <- decision_tree(mode = "classification", tree_depth = 5, min_n = 5) %>% set_engine("rpart")
+predictors <- match ~ tokens + tfidf + proportion + runs_pval + sim_mean
+model <- parsnip::fit(def_tree, predictors, data = training_normalized)
+model
+```
+
+A third model.
+
+```{r}
+def_knn <- nearest_neighbor(mode = "classification", neighbors = 11) %>% set_engine("kknn")
+predictors <- match ~ tokens + tfidf + proportion + runs_pval + sim_mean
+model <- parsnip::fit(def_knn, predictors, data = training_normalized)
+model
+```
+
+Now we can use the model:
+
+```{r}
+model %>% predictions(type = "training")
+model %>% accuracy_measures(type = "training")
+```
+
+We can also use the confusion matrix:
+
+```{r}
+model %>% predictions()  %>% conf_mat(truth = match, estimate = pred_class)
+```
+
+We can see the ROC curve.
+
+```{r}
+curve <- model %>% predictions() %>% roc_curve(match, pred_probs)
+
+curve_points <- curve %>% 
+  filter(.threshold > 0.5) %>% 
+  mutate(.threshold = round(.threshold, 2)) %>% 
+  group_by(.threshold) %>% 
+  slice(1) %>% 
+  filter(.threshold %in% c(0.5, 0.6, 0.7, 0.8, 0.9))
+
+curve %>% 
+  autoplot() + 
+  labs(title = "ROC curve",
+       subtitle = "Select thresholds labeled") +
+  geom_point(data = curve_points,
+             aes(x = 1- specificity, y = sensitivity),
+             color = "red") +
+  geom_text(data = curve_points,
+            aes(x = 1- specificity, y = sensitivity, label = round(.threshold, 3)),
+            color = "red", nudge_x = 0.1)
+```
+
+When you think you have the best model, then run these lines.
+
+```{r}
+model %>% predictions(type = "testing")
+model %>% predictions(type = "testing") %>% conf_mat(truth = match, estimate = pred_class)
+model %>% accuracy_measures(type = "testing")
+
+```
+
