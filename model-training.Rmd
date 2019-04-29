@@ -15,6 +15,7 @@ library(probably)
 library(ggrepel)
 ```
 
+Read in the data.
 
 ```{r}
 spec <- cols(verse_id = col_character(),
